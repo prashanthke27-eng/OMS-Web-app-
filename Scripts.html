@@ -1,0 +1,776 @@
+<script>
+/* Scripts.html — lightweight vanilla SPA (no libraries).
+ * Calls ONLY the server actions defined in Code.gs. */
+(function () {
+'use strict';
+
+/* ---------------- state ---------------- */
+var S = {
+  route: 'dash', boot: null,
+  dash: null, tracker: { rows: [], total: 0, q: '', off: 0, lim: 100 },
+  billing: { rows: [], total: 0, q: '', off: 0, lim: 100 },
+  pending: { rows: [], total: 0, q: '', off: 0, lim: 100 },
+  delivered: { rows: [], total: 0, q: '', off: 0, lim: 100 },
+  customers: [], custQ: '', summary: [], newRows: [],
+  holidays: [], products: []
+};
+var NAV = [
+  ['dash', 'Dashboard'], ['tracker', 'Order Tracker'], ['billing', "Today's Billing"],
+  ['pending', 'Pending Delivery'], ['delivered', 'Delivered Orders'],
+  ['customers', 'Customers'], ['reports', 'Reports'], ['holidays', 'Holidays'],
+  ['import', 'Import / Export']
+];
+
+/* ---------------- server bridge ---------------- */
+function call(action, payload) {
+  return new Promise(function (res, rej) {
+    if (window.google && google.script && google.script.run) {
+      try {
+        google.script.run
+          .withSuccessHandler(function (d) { res(d); })
+          .withFailureHandler(function (e) { rej(new Error((e && e.message) || 'Server error')); })
+          [action](payload || {});
+      } catch (e) { rej(e); }
+    } else rej(new Error('Apps Script bridge unavailable. Deploy as a Web App to enable.'));
+  });
+}
+function unwrap(r) {
+  if (!r) throw new Error('Empty server response.');
+  if (r.success === false) {
+    var e = new Error(r.message || 'Server rejected the request.');
+    e.errors = r.errors; e.suggestions = r.suggestions; e.debug = r.debug;
+    throw e;
+  }
+  return r.data;
+}
+function rpc(action, payload, btnId, label) {
+  var b = btnId ? document.getElementById(btnId) : null;
+  var old = null;
+  if (b) { if (b.disabled) return Promise.reject(new Error('Please wait…')); b.disabled = true; old = b.innerHTML; b.innerHTML = '<span class="spin"></span> ' + (label || 'Working…'); }
+  return call(action, payload).then(function (r) {
+    if (b) { b.disabled = false; b.innerHTML = old; }
+    return unwrap(r);
+  }, function (e) {
+    if (b) { b.disabled = false; b.innerHTML = old; }
+    throw e;
+  });
+}
+
+/* ---------------- dom helpers ---------------- */
+function $(id) { return document.getElementById(id); }
+function esc(s) { return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function toast(msg, bad) {
+  var t = $('toast'); var d = document.createElement('div');
+  if (bad) d.className = 'bad'; d.textContent = msg; t.appendChild(d);
+  setTimeout(function () { d.remove(); }, 6000);
+}
+function errMsg(e) {
+  var m = (e && e.message) || 'Request failed.';
+  if (e && e.suggestions && e.suggestions.length) m += ' Suggestions: ' + e.suggestions.join('; ');
+  return m;
+}
+/* ---------- auto-diagnostics: catch, log to server, keep UI alive ---------- */
+var _diagAt = 0;
+function diag(source, message) {
+  var now = Date.now();
+  if (now - _diagAt < 3000) return; // throttle bursts
+  _diagAt = now;
+  try {
+    call('logClientError', { source: source, message: String(message || '').slice(0, 2000) }).then(function () {}, function () {});
+  } catch (e) {}
+}
+function pill(txt, cls) { return '<span class="pill ' + (cls || '') + '">' + esc(txt || '—') + '</span>'; }
+function payPill(p) {
+  var n = String(p || '').toLowerCase();
+  if (n === 'payment received') return pill(p, 'ok');
+  if (n === 'credit') return pill(p, '');
+  if (n.indexOf('waiting') >= 0) return pill(p, 'warn');
+  return pill(p || '—');
+}
+function debounce(fn, ms) { var t; return function () { var a = arguments, s = this; clearTimeout(t); t = setTimeout(function () { fn.apply(s, a); }, ms || 250); }; }
+function modal(html) {
+  var root = $('modalRoot');
+  root.innerHTML = '<div class="modalback"><div class="modal" role="dialog">' + html + '</div></div>';
+  var back = root.firstChild;
+  back.addEventListener('click', function (e) { if (e.target === back) closeModal(); });
+  return back;
+}
+function closeModal() { $('modalRoot').innerHTML = ''; }
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+
+/* ---------------- nav + boot ---------------- */
+function renderNav() {
+  $('nav').innerHTML = NAV.map(function (n) {
+    return '<button data-r="' + n[0] + '" class="' + (S.route === n[0] ? 'on' : '') + '">' + esc(n[1]) + '</button>';
+  }).join('');
+  Array.prototype.forEach.call($('nav').querySelectorAll('button'), function (b) {
+    b.onclick = function () { go(b.getAttribute('data-r')); };
+  });
+}
+function go(r) { S.route = r; renderNav(); render(); }
+function setBoot(txt) { $('bootStatus').textContent = txt; }
+
+function boot() {
+  renderNav();
+  withRetry(function () { return rpc('getBootstrap', {}, null); }, 2).then(function (boot) {
+    S.boot = boot;
+    setBoot('Today: ' + boot.today + ' · ' + boot.counts.delivered + ' delivered · ' + boot.counts.customers + ' customer rows');
+    return rpc('getCustomers', {}, null);
+  }).then(function (c) { S.customers = c || []; render(); })
+    .catch(function (e) { setBoot('Boot failed'); $('view').innerHTML = '<div class="panel"><b class="err">Could not load the workbook.</b><p class="mut">' + esc(errMsg(e)) + '</p></div>'; });
+}
+function refreshAll() {
+  setBoot('Syncing…');
+  rpc('syncWorkflow', {}, 'syncBtn', 'Syncing…').then(function (r) {
+    toast('Sync done. Moved: ' + r.moved + ' · History updates: ' + r.updatedHistory + ' · Dupes removed: ' + r.removedDupes);
+    return rpc('getBootstrap', {}, null);
+  }).then(function (boot) {
+    S.boot = boot; S.dash = null;
+    setBoot('Today: ' + boot.today);
+    render();
+  }).catch(function (e) { setBoot('Sync failed'); toast(errMsg(e), true); });
+}
+
+function render() {
+  var v = $('view');
+  try {
+    if (S.route === 'dash') return vDash(v);
+    if (S.route === 'tracker') return vTracker(v);
+    if (S.route === 'billing') return vBilling(v);
+    if (S.route === 'pending') return vPending(v);
+    if (S.route === 'delivered') return vDelivered(v);
+    if (S.route === 'customers') return vCustomers(v);
+    if (S.route === 'reports') return vReports(v);
+    if (S.route === 'holidays') return vHolidays(v);
+    if (S.route === 'import') return vImport(v);
+  } catch (e) {
+    diag('view-' + S.route, (e && e.message) || 'render crash');
+    v.innerHTML = '<div class="panel"><b class="err">This view failed to render — the error was logged.</b><p><button class="btn plain" id="v_retry">Retry</button></p></div>';
+    var rb = $('v_retry');
+    if (rb) rb.onclick = render;
+  }
+}
+
+/* ---------------- dashboard (never blank: retry + zeros fallback) ---------------- */
+var DASH_ZERO = { todayOrders: 0, todayQuantity: 0, pendingOrders: 0, deliveredOrders: 0, overdueOrders: 0, totalActiveCustomers: 0, topCustomers: [], topBlends: [], lastUpdated: '', _fallback: true };
+function vDash(v) {
+  if (!S.dash) {
+    v.innerHTML = '<div class="panel">Loading dashboard…</div>';
+    withRetry(function () { return rpc('getDashboard', {}, null); }, 2).then(function (d) { S.dash = d; if (S.route === 'dash') render(); })
+      .catch(function (e) {
+        diag('dashboard-load', (e && e.message) || 'empty response');
+        S.dash = DASH_ZERO; // self-heal: valid zeros UI instead of a crash
+        if (S.route === 'dash') render();
+        else v.innerHTML = '<div class="panel err">Dashboard unavailable. Showing zeros — press Refresh.</div>';
+      });
+    return;
+  }
+  var d = S.dash;
+  v.innerHTML =
+    '<div class="toolbar"><h2 style="margin:0">Dashboard</h2><span class="mut">Last updated: ' + esc(String(d.lastUpdated || '')) + '</span>' +
+    (d._fallback ? '<span class="pill warn">live figures unavailable — showing zeros</span>' : '') +
+    '<button class="btn plain" id="d_ref">Refresh</button></div>' +
+    '<div class="cards">' +
+    kpi('Today Orders', d.todayOrders) + kpi("Today's Quantity", d.todayQuantity) +
+    kpi('Pending Orders', d.pendingOrders) + kpi('Delivered Orders', d.deliveredOrders) +
+    kpi('Overdue Orders', d.overdueOrders) + kpi('Active Customers', d.totalActiveCustomers) +
+    '</div><div class="grid2"><div class="panel"><h3>Top 10 Customers (by quantity)</h3>' +
+    miniTable(d.topCustomers, ['ledgerName', 'orders', 'quantity', 'lastOrderDate'], ['Customer', 'Orders', 'Qty', 'Last Order']) +
+    '</div><div class="panel"><h3>Top 10 Blends (by quantity)</h3>' +
+    miniTable(d.topBlends, ['blendName', 'orders', 'quantity'], ['Blend', 'Orders', 'Qty']) + '</div></div>';
+  $('d_ref').onclick = function () { S.dash = null; render(); };
+}
+function kpi(k, val) { return '<div class="card"><div class="k">' + esc(k) + '</div><div class="v">' + esc(val) + '</div></div>'; }
+function miniTable(rows, keys, labels) {
+  if (!rows || !rows.length) return '<p class="mut">No data.</p>';
+  var h = '<div class="tblwrap"><table><tr>' + labels.map(function (l) { return '<th>' + esc(l) + '</th>'; }).join('') + '</tr>';
+  h += rows.map(function (r) { return '<tr>' + keys.map(function (k) { return '<td>' + esc(r[k] === null || r[k] === undefined ? '' : r[k]) + '</td>'; }).join('') + '</tr>'; }).join('');
+  return h + '</table></div>';
+}
+
+/* ---------------- order tables ---------------- */
+var ORDER_COLS = [
+  ['orderId', 'Order ID'], ['orderDate', 'Order Date'], ['ledgerName', 'Ledger'],
+  ['blendName', 'Blend'], ['qty', 'Qty'], ['uom', 'UOM'], ['route', 'Route'],
+  ['routeDay', 'Route Day'], ['billingDate', 'Billing Date'], ['paymentStatus', 'Payment'],
+  ['billingStatus', 'Billing'], ['remarks', 'Remarks']
+];
+function pagerHtml(p, pref) {
+  var pages = Math.max(1, Math.ceil(p.total / p.lim));
+  var cur = Math.floor(p.off / p.lim) + 1;
+  return '<div class="pager"><button class="btn plain" id="' + pref + '_prev">‹ Prev</button>' +
+    '<span>Page ' + cur + ' of ' + pages + ' · ' + p.total + ' rows</span>' +
+    '<button class="btn plain" id="' + pref + '_next">Next ›</button></div>';
+}
+function bindPager(p, pref, reload) {
+  var pv = $(pref + '_prev'), nx = $(pref + '_next');
+  if (pv) pv.onclick = function () { p.off = Math.max(0, p.off - p.lim); reload(); };
+  if (nx) nx.onclick = function () { if (p.off + p.lim < p.total) p.off += p.lim; reload(); };
+}
+function orderRowHtml(o, actions) {
+  var t = '<tr><td><b>' + esc(o.orderId) + '</b><br><span class="mut">' + esc(o.orderDate || '') + '</span></td>' +
+    '<td>' + esc(o.ledgerName) + '</td><td>' + esc(o.blendName) + '</td>' +
+    '<td>' + esc(o.qty) + ' ' + esc(o.uom) + '</td>' +
+    '<td>' + esc(o.route || '') + '<br><span class="mut">' + esc(o.routeDay || '') + '</span></td>' +
+    '<td>' + esc(o.billingDate || '—') + '</td><td>' + payPill(o.paymentStatus) + '</td>' +
+    '<td>' + (o.billingStatus ? pill(o.billingStatus, o.billingStatus === 'Billed' ? 'ok' : 'warn') : pill('—')) + '</td>' +
+    '<td>' + esc(o.remarks || '') + '</td><td><div class="rowbtns">' + actions + '</div></td></tr>';
+  return t;
+}
+function loadList(action, st, extra) {
+  var payload = { q: st.q, offset: st.off, limit: st.lim };
+  if (extra) for (var k in extra) payload[k] = extra[k];
+  return rpc(action, payload, null).then(function (d) {
+    st.rows = d.rows || []; st.total = d.total || 0; st.hidden = d.hiddenIncomplete | 0;
+  });
+}
+function hiddenNote(st) {
+  return st.hidden > 0
+    ? '<button class="pill warn" style="border:0;cursor:pointer" title="Click to inspect these rows" onclick="showStubs()">' + st.hidden + ' incomplete row(s) hidden — inspect</button>'
+    : '';
+}
+/* Inspector for hidden stub rows: shows raw sheet cells + safe delete. */
+function showStubs() {
+  var m = modal('<h3>Hidden incomplete rows</h3><p class="mut">Rows with an Order ID but no customer. Nothing was deleted — inspect, then remove what is junk.</p><div id="st_body"><p>Loading…</p></div><div class="rowbtns"><button class="btn plain" id="st_close">Close</button></div>');
+  $('st_close').onclick = closeModal;
+  rpc('inspectIncomplete', {}, null, 'Inspecting…').then(function (rows) {
+    if (!rows || !rows.length) { $('st_body').innerHTML = '<p class="ok">No incomplete rows found.</p>'; return; }
+    $('st_body').innerHTML = rows.map(function (r, i) {
+      if (r.error) return '<p class="err">' + esc(r.sheet) + ': ' + esc(r.error) + '</p>';
+      var cells = (r.headers || []).map(function (h, ci) {
+        return '<tr><td class="mut">' + esc(h || ('col ' + (ci + 1))) + '</td><td>' + esc((r.cells || [])[ci] || '') + '</td></tr>';
+      }).join('');
+      return '<div class="panel"><b>' + esc(r.orderId || '(no ID)') + '</b> <span class="mut">' + esc(r.sheet) + ' row ' + r.rowNumber + ' (headers at row ' + r.headerRow + ')</span>' +
+        '<div class="tblwrap" style="max-height:220px"><table>' + cells + '</table></div>' +
+        '<div class="rowbtns" style="margin-top:6px"><button class="btn danger" data-stub="' + i + '">Delete this row</button></div></div>';
+    }).join('');
+    Array.prototype.forEach.call(m.querySelectorAll('[data-stub]'), function (b) {
+      b.onclick = function () {
+        var r = rows[+b.getAttribute('data-stub')];
+        if (!confirm('Delete ' + (r.orderId || 'this row') + ' from ' + r.sheet + ' row ' + r.rowNumber + '? It has no customer data.')) return;
+        rpc('deleteStub', { sheet: r.sheet, rowNumber: r.rowNumber, orderId: r.orderId }, null, 'Deleting…').then(function () {
+          toast('Stub deleted.'); closeModal(); S.dash = null; render();
+        }).catch(function (e) { toast(errMsg(e), true); });
+      };
+    });
+  }).catch(function (e) { $('st_body').innerHTML = '<p class="err">' + esc(errMsg(e)) + '</p>'; });
+}
+function withRetry(fn, tries, delayMs) {
+  return fn().catch(function (e) {
+    if (tries <= 1) throw e;
+    return new Promise(function (res, rej) {
+      setTimeout(function () { withRetry(fn, tries - 1, delayMs).then(res, rej); }, delayMs || 1500);
+    });
+  });
+}
+
+/* ---- Order Tracker ---- */
+function vTracker(v) {
+  v.innerHTML = '<div class="toolbar"><h2 style="margin:0">Order Tracker</h2>' +
+    '<input id="t_q" placeholder="Search orders…" value="' + esc(S.tracker.q) + '" style="min-width:220px">' +
+    '<button class="btn" id="t_new">+ New Order</button><span id="t_hid"></span></div>' +
+    '<div id="t_tbl"><div class="panel">Loading…</div></div>';
+  var reload = function () {
+    loadList('getOrderTracker', S.tracker).then(function () {
+      $('t_hid').innerHTML = hiddenNote(S.tracker);
+      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Actions</th></tr>';
+      h += S.tracker.rows.map(function (o) {
+        return orderRowHtml(o,
+          '<button class="link" data-edit="' + esc(o.orderId) + '">Edit</button>' +
+          '<button class="link" data-pay="' + esc(o.orderId) + '">Payment</button>' +
+          '<button class="link" data-del="' + esc(o.orderId) + '">Delete</button>');
+      }).join('') + '</table></div>' + pagerHtml(S.tracker, 't');
+      $('t_tbl').innerHTML = h || '<div class="panel">No orders.</div>';
+      bindPager(S.tracker, 't', reload);
+      bindOrderActions('t', reload);
+    }).catch(function (e) { $('t_tbl').innerHTML = '<div class="panel err">' + esc(errMsg(e)) + '</div>'; });
+  };
+  $('t_q').oninput = debounce(function () { S.tracker.q = $('t_q').value; S.tracker.off = 0; reload(); });
+  $('t_new').onclick = function () { orderModal(null, reload); };
+  reload();
+}
+function bindOrderActions(pref, reload) {
+  Array.prototype.forEach.call(document.querySelectorAll('[data-edit]'), function (b) {
+    b.onclick = function () { openEditOrder(b.getAttribute('data-edit'), reload); };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-pay]'), function (b) {
+    b.onclick = function () { paymentModal(b.getAttribute('data-pay'), reload); };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-del]'), function (b) {
+    b.onclick = function () {
+      var id = b.getAttribute('data-del');
+      if (!confirm('Delete order ' + id + '?')) return;
+      rpc('deleteOrder', { orderId: id }, null, 'Deleting…').then(function () { toast('Order deleted.'); reload(); })
+        .catch(function (e) { toast(errMsg(e), true); });
+    };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-bill]'), function (b) {
+    b.onclick = function () {
+      var id = b.getAttribute('data-bill');
+      if (!confirm('Mark ' + id + ' as Billed?')) return;
+      rpc('updateBillingStatus', { orderId: id, billingStatus: 'Billed' }, null, 'Updating…')
+        .then(function () { toast(id + ' billed → Pending Delivery.'); reload(); })
+        .catch(function (e) { toast(errMsg(e), true); });
+    };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-done]'), function (b) {
+    b.onclick = function () { deliverModal(b.getAttribute('data-done'), reload); };
+  });
+}
+function openEditOrder(id, reload) {
+  rpc('getOrderTracker', { q: id, limit: 5 }, null).then(function (d) {
+    var o = (d.rows || []).filter(function (x) { return x.orderId === id; })[0];
+    if (!o) {
+      // fall back: search all active views
+      return rpc('getTodaysBilling', { q: id, limit: 5 }, null).then(function (d2) {
+        var o2 = (d2.rows || []).filter(function (x) { return x.orderId === id; })[0];
+        if (!o2) throw new Error('Order not found.');
+        orderModal(o2, reload);
+      });
+    }
+    orderModal(o, reload);
+  }).catch(function (e) { toast(errMsg(e), true); });
+}
+
+/* ---- Today's Billing ---- */
+function vBilling(v) {
+  v.innerHTML = '<div class="toolbar"><h2 style="margin:0">Today\'s Billing</h2>' +
+    '<input id="b_q" placeholder="Search…" value="' + esc(S.billing.q) + '">' +
+    '<span id="b_hid"></span>' +
+    '<span class="mut">Billing Date = today · payment ready · Billing Status Pending → mark Billed.</span></div>' +
+    '<div id="b_tbl"><div class="panel">Loading…</div></div>';
+  var reload = function () {
+    loadList('getTodaysBilling', S.billing).then(function () {
+      $('b_hid').innerHTML = hiddenNote(S.billing);
+      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Actions</th></tr>';
+      h += S.billing.rows.map(function (o) {
+        return orderRowHtml(o,
+          '<button class="link" data-bill="' + esc(o.orderId) + '">Mark Billed</button>' +
+          '<button class="link" data-pay="' + esc(o.orderId) + '">Payment</button>' +
+          '<button class="link" data-edit="' + esc(o.orderId) + '">Edit</button>');
+      }).join('') + '</table></div>' + pagerHtml(S.billing, 'b');
+      $('b_tbl').innerHTML = S.billing.rows.length ? h : '<div class="panel">Nothing ready for billing.</div>';
+      bindPager(S.billing, 'b', reload);
+      bindOrderActions('b', reload);
+    }).catch(function (e) { $('b_tbl').innerHTML = '<div class="panel err">' + esc(errMsg(e)) + '</div>'; });
+  };
+  $('b_q').oninput = debounce(function () { S.billing.q = $('b_q').value; S.billing.off = 0; reload(); });
+  reload();
+}
+
+/* ---- Pending Delivery ---- */
+function vPending(v) {
+  v.innerHTML = '<div class="toolbar"><h2 style="margin:0">Pending Delivery</h2>' +
+    '<input id="p_q" placeholder="Search…" value="' + esc(S.pending.q) + '">' +
+    '<span id="p_hid"></span>' +
+    '<span class="mut">Billed orders awaiting delivery.</span></div>' +
+    '<div id="p_tbl"><div class="panel">Loading…</div></div>';
+  var reload = function () {
+    loadList('getPendingDelivery', S.pending).then(function () {
+      $('p_hid').innerHTML = hiddenNote(S.pending);
+      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Actions</th></tr>';
+      h += S.pending.rows.map(function (o) {
+        return orderRowHtml(o, '<button class="link" data-done="' + esc(o.orderId) + '">Mark Delivered</button>');
+      }).join('') + '</table></div>' + pagerHtml(S.pending, 'p');
+      $('p_tbl').innerHTML = S.pending.rows.length ? h : '<div class="panel">No pending deliveries.</div>';
+      bindPager(S.pending, 'p', reload);
+      bindOrderActions('p', reload);
+    }).catch(function (e) { $('p_tbl').innerHTML = '<div class="panel err">' + esc(errMsg(e)) + '</div>'; });
+  };
+  $('p_q').oninput = debounce(function () { S.pending.q = $('p_q').value; S.pending.off = 0; reload(); });
+  reload();
+}
+
+/* ---- Delivered Orders ---- */
+function vDelivered(v) {
+  v.innerHTML = '<div class="toolbar"><h2 style="margin:0">Delivered Orders</h2>' +
+    '<input id="dl_q" placeholder="Search history…" value="' + esc(S.delivered.q) + '">' +
+    '<button class="btn plain" id="dl_csv">Export CSV</button></div>' +
+    '<div id="dl_tbl"><div class="panel">Loading…</div></div>';
+  var reload = function () {
+    loadList('getDeliveredOrders', S.delivered).then(function () {
+      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billed</th><th>Delivered on</th><th>Remarks</th></tr>';
+      h += S.delivered.rows.map(function (o) {
+        return '<tr><td><b>' + esc(o.orderId) + '</b><br><span class="mut">' + esc(o.orderDate || '') + '</span></td>' +
+          '<td>' + esc(o.ledgerName) + '</td><td>' + esc(o.blendName) + '</td>' +
+          '<td>' + esc(o.qty) + ' ' + esc(o.uom) + '</td>' +
+          '<td>' + esc(o.route || '') + '<br><span class="mut">' + esc(o.routeDay || '') + '</span></td>' +
+          '<td>' + esc(o.billingDate || '') + '</td><td>' + pill(o.deliveredOn || '', 'ok') + '</td>' +
+          '<td>' + esc(o.remarks || '') + '</td></tr>';
+      }).join('') + '</table></div>' + pagerHtml(S.delivered, 'dl');
+      $('dl_tbl').innerHTML = h;
+      bindPager(S.delivered, 'dl', reload);
+    }).catch(function (e) { $('dl_tbl').innerHTML = '<div class="panel err">' + esc(errMsg(e)) + '</div>'; });
+  };
+  $('dl_q').oninput = debounce(function () { S.delivered.q = $('dl_q').value; S.delivered.off = 0; reload(); });
+  $('dl_csv').onclick = function () {
+    rpc('exportDeliveredOrders', { q: S.delivered.q }, 'dl_csv', 'Exporting…').then(function (d) {
+      downloadCsv('delivered-orders.csv', d.headers, d.rows);
+      toast('Exported ' + d.rows.length + ' rows.');
+    }).catch(function (e) { toast(errMsg(e), true); });
+  };
+  reload();
+}
+function downloadCsv(name, headers, rows) {
+  var q = function (x) { var s = String(x === null || x === undefined ? '' : x); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  var csv = headers.map(q).join(',') + '\n' + rows.map(function (r) { return r.map(q).join(','); }).join('\n');
+  var blob = new Blob([csv], { type: 'text/csv' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+}
+
+/* ---- order create/edit modal ---- */
+function orderModal(existing, reload) {
+  var isEdit = !!existing;
+  var m = modal('<h3>' + (isEdit ? 'Edit Order ' + esc(existing.orderId) : 'New Order') + '</h3>' +
+    '<div class="fgrid">' +
+    '<label class="f full">Customer / Ledger<input id="o_cust" autocomplete="off" placeholder="Type to search…" value="' + esc(existing ? existing.ledgerName : '') + '"><div class="acwrap"><div class="aclist" id="o_ac" style="display:none"></div></div></label>' +
+    '<input type="hidden" id="o_custid" value="' + esc(existing ? (existing._ledgerId || '') : '') + '">' +
+    '<label class="f full">Approved Blend<select id="o_blend"><option value="">Select customer first…</option></select></label>' +
+    '<label class="f">Qty<input id="o_qty" type="number" min="0" step="any" value="' + esc(existing ? existing.qty : '') + '"></label>' +
+    '<label class="f">UOM<select id="o_uom">' + uomOpts(existing ? existing.uom : '') + '</select></label>' +
+    '<label class="f">Order Date<input id="o_od" type="date" value="' + esc(existing ? existing.orderDate : (S.boot ? S.boot.today : '')) + '"></label>' +
+    '<label class="f">Billing Date (optional)<input id="o_bd" type="date" value="' + esc(existing && existing.billingDate ? existing.billingDate : '') + '"></label>' +
+    '<label class="f">Route<input id="o_route" value="' + esc(existing ? existing.route : '') + '"></label>' +
+    '<label class="f">Route Day<input id="o_rday" value="' + esc(existing ? existing.routeDay : '') + '"></label>' +
+    '<label class="f">Payment Status<select id="o_pay">' + payOpts(existing ? existing.paymentStatus : '') + '</select></label>' +
+    '<label class="f">Payment Terms<input id="o_terms" disabled value="' + esc(existing ? existing.paymentTerms : '') + '"></label>' +
+    '<label class="f full">Remarks<textarea id="o_rem" rows="2">' + esc(existing ? existing.remarks : '') + '</textarea></label>' +
+    '</div><div id="o_err" class="err" style="margin:8px 0"></div>' +
+    '<div class="rowbtns"><button class="btn" id="o_save">Save</button><button class="btn plain" id="o_cancel">Cancel</button></div>');
+  $('o_cancel').onclick = closeModal;
+  var custInput = $('o_cust'), ac = $('o_ac'), hi = -1, items = [];
+  var paintAc = function () {
+    if (!items.length) { ac.style.display = 'none'; return; }
+    ac.style.display = 'block';
+    ac.innerHTML = items.map(function (c, i) {
+      return '<div data-i="' + i + '" class="' + (i === hi ? 'on' : '') + '"><b>' + esc(c.ledgerName) + '</b><br><span class="mut">' + esc(c.ledgerId || '') + ' · ' + esc(c.route || '') + ' ' + esc(c.routeDay || '') + ' · ' + esc(c.paymentTerms || '') + '</span></div>';
+    }).join('');
+    Array.prototype.forEach.call(ac.querySelectorAll('div'), function (d) {
+      var pick = function () { pickCust(items[+d.getAttribute('data-i')]); };
+      // mousedown/touchstart fire BEFORE input blur hides the list — a plain
+      // onclick alone loses that race (tap hides list, click never lands).
+      d.addEventListener('mousedown', function (e) { e.preventDefault(); pick(); });
+      d.addEventListener('touchstart', function (e) { e.preventDefault(); pick(); }, { passive: false });
+      d.addEventListener('click', pick);
+    });
+  };
+  var pickCust = function (c) {
+    custInput.value = c.ledgerName; $('o_custid').value = c.ledgerId || '';
+    ac.style.display = 'none';
+    loadBlends(c.ledgerId || c.ledgerName, existing ? existing.blendName : '');
+    if (!isEdit) {
+      $('o_route').value = c.route || ''; $('o_rday').value = c.routeDay || '';
+      $('o_terms').value = c.paymentTerms || '';
+      var ps = $('o_pay');
+      ps.value = (String(c.paymentTerms).toLowerCase() === 'credit') ? 'Credit' : 'Waiting for Payment';
+    }
+  };
+  var doSearch = debounce(function () {
+    var q = custInput.value;
+    $('o_custid').value = '';
+    if (q.length < 2) { ac.style.display = 'none'; return; }
+    rpc('searchCustomers', { q: q, limit: 12 }, null).then(function (r) {
+      items = r || []; hi = items.length ? 0 : -1; paintAc();
+    }).catch(function () {});
+  }, 220);
+  custInput.oninput = doSearch;
+  custInput.onkeydown = function (e) {
+    if (ac.style.display === 'none') return;
+    if (e.key === 'ArrowDown') { hi = Math.min(items.length - 1, hi + 1); paintAc(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { hi = Math.max(0, hi - 1); paintAc(); e.preventDefault(); }
+    else if (e.key === 'Enter' && hi >= 0) { pickCust(items[hi]); e.preventDefault(); }
+  };
+  custInput.onblur = function () { setTimeout(function () { ac.style.display = 'none'; }, 200); };
+  var loadBlends = function (idOrName, sel) {
+    var payload = $('o_custid').value ? { ledgerId: $('o_custid').value } : { ledgerName: custInput.value };
+    rpc('getApprovedBlends', payload, null).then(function (d) {
+      var bl = $('o_blend');
+      bl.innerHTML = '<option value="">— select blend —</option>' + (d.blends || []).map(function (b) {
+        return '<option ' + (b === sel ? 'selected' : '') + ' value="' + esc(b) + '">' + esc(b) + '</option>';
+      }).join('');
+      if (!$('o_custid').value && d.ledgerId) $('o_custid').value = d.ledgerId;
+    }).catch(function (e) { $('o_err').textContent = errMsg(e); });
+  };
+  // preselect when editing
+  if (isEdit && existing.ledgerName) {
+    var payload0 = existing._ledgerId ? { ledgerId: existing._ledgerId } : { ledgerName: existing.ledgerName };
+    rpc('getApprovedBlends', payload0, null).then(function (d) {
+      $('o_blend').innerHTML = '<option value="">— select blend —</option>' + (d.blends || []).map(function (b) {
+        return '<option ' + (b === existing.blendName ? 'selected' : '') + ' value="' + esc(b) + '">' + esc(b) + '</option>';
+      }).join('');
+      if (d.ledgerId) $('o_custid').value = d.ledgerId;
+    }).catch(function () {
+      $('o_blend').innerHTML = '<option selected>' + esc(existing.blendName) + '</option>';
+    });
+  }
+  $('o_save').onclick = function () {
+    var payload = {
+      ledgerId: $('o_custid').value || undefined, ledgerName: custInput.value,
+      blendName: $('o_blend').value, qty: $('o_qty').value, uom: $('o_uom').value,
+      orderDate: $('o_od').value, billingDate: $('o_bd').value || '',
+      route: $('o_route').value, routeDay: $('o_rday').value,
+      paymentStatus: $('o_pay').value, remarks: $('o_rem').value
+    };
+    if (isEdit) payload.orderId = existing.orderId;
+    rpc(isEdit ? 'updateOrder' : 'createOrder', payload, 'o_save', 'Saving…').then(function (r) {
+      closeModal(); toast((isEdit ? 'Updated ' : 'Created ') + r.orderId); S.dash = null; reload();
+    }).catch(function (e) {
+      var msg = errMsg(e);
+      if (e.debug && e.debug.headers) msg += ' Detected headers (row ' + e.debug.headerRow + '): ' + e.debug.headers.join(' | ');
+      $('o_err').textContent = msg;
+    });
+  };
+}
+function uomOpts(sel) {
+  var u = ['KG', 'LTR', 'PAC'];
+  return '<option value="">—</option>' + u.map(function (x) {
+    return '<option ' + (String(sel).toUpperCase() === x ? 'selected' : '') + ' value="' + x + '">' + x + '</option>';
+  }).join('');
+}
+function payOpts(sel) {
+  var u = ['Waiting for Payment', 'Payment Received', 'Credit'];
+  return u.map(function (x) {
+    return '<option ' + (sel === x ? 'selected' : '') + ' value="' + x + '">' + x + '</option>';
+  }).join('');
+}
+function paymentModal(id, reload) {
+  modal('<h3>Payment — ' + esc(id) + '</h3><label class="f">Payment Status<select id="pm_s">' + payOpts('') + '</select></label>' +
+    '<div id="pm_e" class="err" style="margin:8px 0"></div>' +
+    '<div class="rowbtns"><button class="btn" id="pm_go">Save</button><button class="btn plain" id="pm_c">Cancel</button></div>');
+  $('pm_c').onclick = closeModal;
+  $('pm_go').onclick = function () {
+    rpc('updatePaymentStatus', { orderId: id, paymentStatus: $('pm_s').value }, 'pm_go', 'Saving…')
+      .then(function () { closeModal(); toast('Payment updated.'); S.dash = null; reload(); })
+      .catch(function (e) { $('pm_e').textContent = errMsg(e); });
+  };
+}
+function deliverModal(id, reload) {
+  var today = S.boot ? S.boot.today : '';
+  modal('<h3>Deliver — ' + esc(id) + '</h3><label class="f">Delivered on<input id="dv_d" type="date" value="' + esc(today) + '"></label>' +
+    '<div id="dv_e" class="err" style="margin:8px 0"></div>' +
+    '<div class="rowbtns"><button class="btn" id="dv_go">Mark Delivered</button><button class="btn plain" id="dv_c">Cancel</button></div>');
+  $('dv_c').onclick = closeModal;
+  $('dv_go').onclick = function () {
+    rpc('updateDeliveryStatus', { orderId: id, deliveredOn: $('dv_d').value }, 'dv_go', 'Saving…')
+      .then(function () { closeModal(); toast(id + ' delivered.'); S.dash = null; reload(); })
+      .catch(function (e) { $('dv_e').textContent = errMsg(e); });
+  };
+}
+
+/* ---------------- customers ---------------- */
+function vCustomers(v) {
+  v.innerHTML = '<div class="toolbar"><h2 style="margin:0">Customers</h2>' +
+    '<input id="c_q" placeholder="Search customers…" value="' + esc(S.custQ) + '">' +
+    '<button class="btn" id="c_new">+ New Customer</button></div><div id="c_tbl"></div>';
+  var paint = function (rows) {
+    var h = '<div class="tblwrap"><table><tr><th>Ledger</th><th>Route</th><th>Terms</th><th>Approved Blends</th><th>Status</th><th>Actions</th></tr>';
+    h += rows.map(function (c) {
+      return '<tr><td><b>' + esc(c.ledgerName) + '</b><br><span class="mut">' + esc(c.ledgerId || '') + (c.mobile ? ' · ' + esc(c.mobile) : '') + '</span></td>' +
+        '<td>' + esc(c.route || '') + '<br><span class="mut">' + esc(c.routeDay || '') + '</span></td>' +
+        '<td>' + esc(c.paymentTerms || '') + '</td>' +
+        '<td>' + (c.approvedBlends || []).map(function (b) { return pill(b); }).join(' ') + '</td>' +
+        '<td>' + esc(c.customerStatus || '') + '</td>' +
+        '<td><div class="rowbtns"><button class="link" data-cid="' + esc(c.ledgerId) + '">Edit</button></div></td></tr>';
+    }).join('') + '</table></div><p class="mut">' + rows.length + ' shown</p>';
+    $('c_tbl').innerHTML = h;
+    Array.prototype.forEach.call(document.querySelectorAll('[data-cid]'), function (b) {
+      b.onclick = function () { customerModal(b.getAttribute('data-cid')); };
+    });
+  };
+  var reload = function () {
+    var act = S.custQ.length >= 1 ? rpc('searchCustomers', { q: S.custQ, limit: 200 }, null) : rpc('getCustomers', {}, null);
+    act.then(function (r) { paint(r || []); }).catch(function (e) { $('c_tbl').innerHTML = '<div class="panel err">' + esc(errMsg(e)) + '</div>'; });
+  };
+  $('c_q').oninput = debounce(function () { S.custQ = $('c_q').value; reload(); });
+  $('c_new').onclick = function () { customerModal(null); };
+  reload();
+}
+function customerModal(ledgerId) {
+  var cur = ledgerId ? (S.customers.filter(function (c) { return c.ledgerId === ledgerId; })[0] ||
+    null) : null;
+  var getCur = cur ? Promise.resolve(cur) :
+    (ledgerId ? rpc('searchCustomers', { q: ledgerId, limit: 5 }, null).then(function (r) { return (r || [])[0] || null; }) : Promise.resolve(null));
+  getCur.then(function (c) {
+    var isEdit = !!c;
+    modal('<h3>' + (isEdit ? 'Edit Customer' : 'New Customer') + '</h3><div class="fgrid">' +
+      '<label class="f full">Ledger Name<input id="cu_n" value="' + esc(c ? c.ledgerName : '') + '"></label>' +
+      '<label class="f">Ledger ID' + (isEdit ? '' : ' (optional — auto)') + '<input id="cu_id" value="' + esc(c ? c.ledgerId : '') + '"' + (isEdit ? ' disabled' : '') + '></label>' +
+      '<label class="f">Payment Terms<select id="cu_t"><option>Advance</option><option' + (c && c.paymentTerms === 'Credit' ? ' selected' : '') + '>Credit</option></select></label>' +
+      '<label class="f">Route<input id="cu_r" value="' + esc(c ? c.route : '') + '"></label>' +
+      '<label class="f">Route Day<input id="cu_rd" value="' + esc(c ? c.routeDay : '') + '"></label>' +
+      '<label class="f">Mobile<input id="cu_m" value="' + esc(c ? c.mobile : '') + '"></label>' +
+      '<label class="f">Status<select id="cu_s"><option' + (!c || c.customerStatus === 'Active' ? ' selected' : '') + '>Active</option><option' + (c && c.customerStatus === 'Inactive' ? ' selected' : '') + '>Inactive</option></select></label>' +
+      '<label class="f">City<input id="cu_city" value="' + esc(c ? c.city : '') + '"></label>' +
+      '<label class="f">Area<input id="cu_area" value="' + esc(c ? c.area : '') + '"></label>' +
+      '<label class="f full">Address<textarea id="cu_a" rows="2">' + esc(c ? c.address : '') + '</textarea></label>' +
+      '<label class="f full">Approved Blends (one per line)<textarea id="cu_b" rows="4">' + esc(c ? (c.approvedBlends || []).join('\n') : '') + '</textarea></label>' +
+      '</div><div id="cu_e" class="err" style="margin:8px 0"></div>' +
+      '<div class="rowbtns"><button class="btn" id="cu_go">Save</button><button class="btn plain" id="cu_c">Cancel</button></div>');
+    $('cu_c').onclick = closeModal;
+    $('cu_go').onclick = function () {
+      var blends = $('cu_b').value.split('\n').map(function (x) { return x.trim(); }).filter(function (x) { return x; });
+      var payload = {
+        ledgerName: $('cu_n').value, paymentTerms: $('cu_t').value, route: $('cu_r').value,
+        routeDay: $('cu_rd').value, mobile: $('cu_m').value, customerStatus: $('cu_s').value,
+        city: $('cu_city').value, area: $('cu_area').value, address: $('cu_a').value, approvedBlends: blends
+      };
+      var act = isEdit ? 'updateCustomer' : 'addCustomer';
+      if (isEdit) payload.ledgerId = c.ledgerId; else if ($('cu_id').value.trim()) payload.ledgerId = $('cu_id').value.trim();
+      rpc(act, payload, 'cu_go', 'Saving…').then(function () {
+        closeModal(); toast('Customer saved.');
+        rpc('getCustomers', {}, null).then(function (all) { S.customers = all || []; render(); });
+      }).catch(function (e) { $('cu_e').textContent = errMsg(e); });
+    };
+  });
+}
+
+/* ---------------- reports ---------------- */
+function vReports(v) {
+  var today = S.boot ? S.boot.today : '';
+  v.innerHTML = '<div class="toolbar"><h2 style="margin:0">Reports</h2>' +
+    '<input id="r_q" placeholder="Search summary…"></div>' +
+    '<div class="panel"><h3>Customer Summary</h3><div id="r_sum">Loading…</div></div>' +
+    '<div class="panel"><h3>New Customers</h3><div class="toolbar"><input id="n_f" type="date" value="' + esc(today.slice(0, 8) + '01') + '"><input id="n_t" type="date" value="' + esc(today) + '">' +
+    '<button class="btn plain" id="n_go">Run</button></div><div id="n_out"></div>' +
+    '<p class="mut">Counts ledgers whose first-ever order falls in the period. Edits and duplicates are never counted.</p></div>' +
+    '<div class="panel"><h3>Month-to-Date (MTD)</h3><div class="toolbar"><input id="m_m" type="month" value="' + esc(today.slice(0, 7)) + '">' +
+    '<button class="btn plain" id="m_go">Run</button></div><div id="m_out"></div>' +
+    '<p class="mut">Totals + ledger-wise breakdown for the selected month, across active and delivered orders by Order Date.</p></div>';
+  var loadSum = function (q) {
+    rpc('getCustomerSummary', { q: q || '' }, null).then(function (rows) {
+      S.summary = rows || [];
+      $('r_sum').innerHTML = miniTable(S.summary.slice(0, 200),
+        ['ledgerName', 'totalOrders', 'lifetimeQuantity', 'favouriteBlend', 'pendingOrders', 'deliveredOrders', 'lastOrderDate', 'healthStatus'],
+        ['Customer', 'Orders', 'Qty', 'Favourite Blend', 'Pending', 'Delivered', 'Last Order', 'Health']) +
+        '<p class="mut">' + S.summary.length + ' customers</p>';
+    }).catch(function (e) { $('r_sum').innerHTML = '<span class="err">' + esc(errMsg(e)) + '</span>'; });
+  };
+  $('r_q').oninput = debounce(function () { loadSum($('r_q').value); }, 300);
+  $('n_go').onclick = function () {
+    rpc('getNewCustomers', { from: $('n_f').value, to: $('n_t').value }, 'n_go', 'Running…').then(function (d) {
+      $('n_out').innerHTML = '<p><b>' + d.count + '</b> new customer(s) from ' + esc(d.from) + ' to ' + esc(d.to) + '</p>' +
+        miniTable(d.rows, ['ledgerName', 'ledgerId', 'firstOrderDate', 'totalOrders', 'lifetimeQuantity'], ['Customer', 'Ledger ID', 'First Order', 'Orders', 'Qty']);
+    }).catch(function (e) { toast(errMsg(e), true); });
+  };
+  $('m_go').onclick = function () {
+    rpc('getMtdReport', { month: $('m_m').value }, 'm_go', 'Running…').then(function (d) {
+      $('m_out').innerHTML = '<p><b>' + d.totalOrders + '</b> order(s) · <b>' + d.totalQuantity + '</b> units in ' + esc(d.month) + '</p>' +
+        miniTable(d.ledgerWise, ['ledgerName', 'orders', 'quantity'], ['Ledger', 'Orders', 'Qty']);
+    }).catch(function (e) { toast(errMsg(e), true); });
+  };
+  loadSum('');
+}
+
+/* ---------------- holidays ---------------- */
+function vHolidays(v) {
+  v.innerHTML = '<div class="toolbar"><h2 style="margin:0">Holiday Master</h2>' +
+    '<input id="h_d" type="date"><input id="h_n" placeholder="Holiday name"><input id="h_t" placeholder="Type" value="National">' +
+    '<button class="btn" id="h_add">Add</button></div><div id="h_tbl"></div>';
+  var reload = function () {
+    rpc('getHolidays', {}, null).then(function (rows) {
+      S.holidays = rows || [];
+      var h = '<div class="tblwrap"><table><tr><th>Date</th><th>Name</th><th>Type</th><th></th></tr>';
+      h += S.holidays.map(function (x) {
+        return '<tr><td>' + esc(x.date) + '</td><td>' + esc(x.name) + '</td><td>' + esc(x.type) + '</td>' +
+          '<td><button class="link" data-hd="' + esc(x.date) + '" data-hn="' + esc(x.name) + '">Delete</button></td></tr>';
+      }).join('') + '</table></div>';
+      $('h_tbl').innerHTML = h;
+      Array.prototype.forEach.call(document.querySelectorAll('[data-hd]'), function (b) {
+        b.onclick = function () {
+          if (!confirm('Delete holiday?')) return;
+          rpc('deleteHoliday', { date: b.getAttribute('data-hd'), name: b.getAttribute('data-hn') }, null, 'Deleting…')
+            .then(function () { toast('Deleted.'); reload(); }).catch(function (e) { toast(errMsg(e), true); });
+        };
+      });
+    }).catch(function (e) { $('h_tbl').innerHTML = '<div class="panel err">' + esc(errMsg(e)) + '</div>'; });
+  };
+  $('h_add').onclick = function () {
+    rpc('addHoliday', { date: $('h_d').value, name: $('h_n').value, type: $('h_t').value }, 'h_add', 'Adding…')
+      .then(function () { toast('Holiday added.'); $('h_n').value = ''; reload(); })
+      .catch(function (e) { toast(errMsg(e), true); });
+  };
+  reload();
+}
+
+/* ---------------- import / export ---------------- */
+var PARSED = [];
+function vImport(v) {
+  v.innerHTML = '<div class="panel"><h3>Bulk Import (Validate → Preview → Confirm)</h3>' +
+    '<div class="toolbar"><select id="i_kind"><option value="orders">Orders</option><option value="delivered">Delivered Orders</option><option value="customers">Customers</option><option value="products">Products/Blends</option></select>' +
+    '<button class="btn plain" id="i_tpl">Download Template</button></div>' +
+    '<label class="f">Paste CSV (first row = headers)<textarea id="i_csv" rows="8" style="width:100%"></textarea></label>' +
+    '<div class="toolbar"><button class="btn plain" id="i_val">Validate</button><button class="btn" id="i_go" disabled>Confirm &amp; Write</button></div>' +
+    '<div id="i_msg"></div><div id="i_out"></div></div>' +
+    '<div class="panel"><h3>Export</h3><div class="toolbar"><button class="btn plain" id="x_dl">Export Delivered Orders (CSV)</button></div>' +
+    '<p class="mut">Templates always use the workbook\'s actual headings.</p></div>';
+  $('i_tpl').onclick = function () {
+    rpc('getBulkTemplate', { kind: $('i_kind').value }, 'i_tpl', 'Loading…').then(function (d) {
+      downloadCsv($('i_kind').value + '-template.csv', d.headers, []);
+    }).catch(function (e) { toast(errMsg(e), true); });
+  };
+  $('x_dl').onclick = function () {
+    rpc('exportDeliveredOrders', {}, 'x_dl', 'Exporting…').then(function (d) {
+      downloadCsv('delivered-orders.csv', d.headers, d.rows); toast('Exported ' + d.rows.length + ' rows.');
+    }).catch(function (e) { toast(errMsg(e), true); });
+  };
+  var parseCsv = function (text) {
+    var rows = [], cur = [''], q = false;
+    for (var i = 0; i < text.length; i++) {
+      var c = text[i];
+      if (q) {
+        if (c === '"') { if (text[i + 1] === '"') { cur[cur.length - 1] += '"'; i++; } else q = false; }
+        else cur[cur.length - 1] += c;
+      } else if (c === '"') q = true;
+      else if (c === ',') cur.push('');
+      else if (c === '\n' || c === '\r') {
+        if (cur.length > 1 || cur[0] !== '') rows.push(cur);
+        cur = [''];
+        if (c === '\r' && text[i + 1] === '\n') i++;
+      } else cur[cur.length - 1] += c;
+    }
+    if (cur.length > 1 || cur[0] !== '') rows.push(cur);
+    if (!rows.length) return { headers: [], rows: [] };
+    var headers = rows[0].map(function (h) { return h.trim(); });
+    return {
+      headers: headers,
+      rows: rows.slice(1).filter(function (r) { return r.some(function (x) { return String(x).trim() !== ''; }); })
+        .map(function (r) { var o = {}; headers.forEach(function (h, j) { o[h] = (r[j] || '').trim(); }); return o; })
+    };
+  };
+  $('i_val').onclick = function () {
+    var parsed = parseCsv($('i_csv').value);
+    PARSED = parsed.rows;
+    if (!PARSED.length) { toast('No data rows found.', true); return; }
+    rpc('bulkUpload', { kind: $('i_kind').value, rows: PARSED, confirm: false }, 'i_val', 'Validating…').then(function (r) {
+      var bad = r.invalid || [];
+      $('i_msg').innerHTML = '<p>Valid: <b class="ok">' + r.validCount + '</b> · Invalid: <b class="err">' + r.invalidCount + '</b></p>';
+      $('i_out').innerHTML = bad.length
+        ? '<b class="err">Fix these before confirming:</b>' + miniTable(bad.slice(0, 30).map(function (x) { return { row: 'line ' + x.line, err: x.error }; }), ['row', 'err'], ['Row', 'Error'])
+        : '<p class="ok">All rows valid. Press Confirm &amp; Write.</p>';
+      $('i_go').disabled = !(r.validCount > 0 && !bad.length);
+    }).catch(function (e) { toast(errMsg(e), true); });
+  };
+  $('i_go').onclick = function () {
+    rpc('bulkUpload', { kind: $('i_kind').value, rows: PARSED, confirm: true }, 'i_go', 'Writing…').then(function (r) {
+      var w = (r.warnings || []).length ? '<br>Warnings:<br>' + r.warnings.slice(0, 10).map(esc).join('<br>') : '';
+      toast('Written: ' + r.added + ' rows.' + ((r.warnings || []).length ? ' ' + r.warnings.length + ' warning(s).' : ''));
+      $('i_msg').innerHTML = '<p class="ok">Written: ' + r.added + '</p>' + w;
+      $('i_go').disabled = true; S.dash = null;
+    }).catch(function (e) { toast(errMsg(e), true); });
+  };
+}
+
+/* ---------------- wire up ---------------- */
+document.addEventListener('DOMContentLoaded', function () {
+  window.addEventListener('error', function (e) { diag('window-error', e.message); });
+  window.addEventListener('unhandledrejection', function (e) {
+    diag('unhandled-rejection', (e.reason && e.reason.message) || String(e.reason || ''));
+  });
+  var sb = $('syncBtn');
+  if (sb) sb.onclick = refreshAll;
+  boot();
+});
+})();
+</script>

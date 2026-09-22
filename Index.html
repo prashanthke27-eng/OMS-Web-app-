@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Order Management</div>
+    <nav id="nav" class="nav" aria-label="Sections"></nav>
+    <div class="topright">
+      <button id="syncBtn" class="btn ghost" title="Reconcile workflow sheets">Sync</button>
+      <span id="bootStatus" class="bootstatus">Loading…</span>
+    </div>
+  </header>
+  <main id="view" class="view"></main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="modalRoot"></div>
+  <?!= include('Scripts'); ?>
+</body>
+</html>
