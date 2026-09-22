@@ -59,6 +59,10 @@ function rpc(action, payload, btnId, label) {
 /* ---------------- dom helpers ---------------- */
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function dateMonthStart(dateStr) {
+  if (!dateStr) return '';
+  return dateStr.slice(0, 7) + '-01';
+}
 function toast(msg, bad) {
   var t = $('toast'); var d = document.createElement('div');
   if (bad) d.className = 'bad'; d.textContent = msg; t.appendChild(d);
@@ -159,7 +163,7 @@ function vDash(v) {
     withRetry(function () { return rpc('getDashboard', {}, null); }, 2).then(function (d) { S.dash = d; if (S.route === 'dash') render(); })
       .catch(function (e) {
         diag('dashboard-load', (e && e.message) || 'empty response');
-        S.dash = DASH_ZERO; // self-heal: valid zeros UI instead of a crash
+        S.dash = DASH_ZERO;
         if (S.route === 'dash') render();
         else v.innerHTML = '<div class="panel err">Dashboard unavailable. Showing zeros — press Refresh.</div>';
       });
@@ -232,10 +236,11 @@ function hiddenNote(st) {
 /* Inspector for hidden stub rows: shows raw sheet cells + safe delete. */
 function showStubs() {
   var m = modal('<h3>Hidden incomplete rows</h3><p class="mut">Rows with an Order ID but no customer. Nothing was deleted — inspect, then remove what is junk.</p><div id="st_body"><p>Loading…</p></div><div class="rowbtns"><button class="btn plain" id="st_close">Close</button></div>');
+  var body = $('st_body');
   $('st_close').onclick = closeModal;
   rpc('inspectIncomplete', {}, null, 'Inspecting…').then(function (rows) {
-    if (!rows || !rows.length) { $('st_body').innerHTML = '<p class="ok">No incomplete rows found.</p>'; return; }
-    $('st_body').innerHTML = rows.map(function (r, i) {
+    if (!rows || !rows.length) { body.innerHTML = '<p class="ok">No incomplete rows found.</p>'; return; }
+    body.innerHTML = rows.map(function (r, i) {
       if (r.error) return '<p class="err">' + esc(r.sheet) + ': ' + esc(r.error) + '</p>';
       var cells = (r.headers || []).map(function (h, ci) {
         return '<tr><td class="mut">' + esc(h || ('col ' + (ci + 1))) + '</td><td>' + esc((r.cells || [])[ci] || '') + '</td></tr>';
@@ -253,7 +258,7 @@ function showStubs() {
         }).catch(function (e) { toast(errMsg(e), true); });
       };
     });
-  }).catch(function (e) { $('st_body').innerHTML = '<p class="err">' + esc(errMsg(e)) + '</p>'; });
+  }).catch(function (e) { body.innerHTML = '<p class="err">' + esc(errMsg(e)) + '</p>'; });
 }
 function withRetry(fn, tries, delayMs) {
   return fn().catch(function (e) {
@@ -273,7 +278,7 @@ function vTracker(v) {
   var reload = function () {
     loadList('getOrderTracker', S.tracker).then(function () {
       $('t_hid').innerHTML = hiddenNote(S.tracker);
-      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Actions</th></tr>';
+      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Action</th></tr>';
       h += S.tracker.rows.map(function (o) {
         return orderRowHtml(o,
           '<button class="link" data-edit="' + esc(o.orderId) + '">Edit</button>' +
@@ -321,7 +326,6 @@ function openEditOrder(id, reload) {
   rpc('getOrderTracker', { q: id, limit: 5 }, null).then(function (d) {
     var o = (d.rows || []).filter(function (x) { return x.orderId === id; })[0];
     if (!o) {
-      // fall back: search all active views
       return rpc('getTodaysBilling', { q: id, limit: 5 }, null).then(function (d2) {
         var o2 = (d2.rows || []).filter(function (x) { return x.orderId === id; })[0];
         if (!o2) throw new Error('Order not found.');
@@ -342,7 +346,7 @@ function vBilling(v) {
   var reload = function () {
     loadList('getTodaysBilling', S.billing).then(function () {
       $('b_hid').innerHTML = hiddenNote(S.billing);
-      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Actions</th></tr>';
+      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Action</th></tr>';
       h += S.billing.rows.map(function (o) {
         return orderRowHtml(o,
           '<button class="link" data-bill="' + esc(o.orderId) + '">Mark Billed</button>' +
@@ -368,7 +372,7 @@ function vPending(v) {
   var reload = function () {
     loadList('getPendingDelivery', S.pending).then(function () {
       $('p_hid').innerHTML = hiddenNote(S.pending);
-      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Actions</th></tr>';
+      var h = '<div class="tblwrap"><table><tr><th>Order</th><th>Ledger</th><th>Blend</th><th>Qty</th><th>Route</th><th>Billing Date</th><th>Payment</th><th>Billing</th><th>Remarks</th><th>Action</th></tr>';
       h += S.pending.rows.map(function (o) {
         return orderRowHtml(o, '<button class="link" data-done="' + esc(o.orderId) + '">Mark Delivered</button>');
       }).join('') + '</table></div>' + pagerHtml(S.pending, 'p');
@@ -425,7 +429,7 @@ function orderModal(existing, reload) {
   var isEdit = !!existing;
   var m = modal('<h3>' + (isEdit ? 'Edit Order ' + esc(existing.orderId) : 'New Order') + '</h3>' +
     '<div class="fgrid">' +
-    '<label class="f full">Customer / Ledger<input id="o_cust" autocomplete="off" placeholder="Type to search…" value="' + esc(existing ? existing.ledgerName : '') + '"><div class="acwrap"><div class="aclist" id="o_ac" style="display:none"></div></div></label>' +
+    '<label class="f full">Customer / Ledger<input id="o_cust" autocomplete="off" placeholder="Type to search…" value="' + esc(existing ? existing.ledgerName : '') + '"><div class="acwrap"><div id="o_ac" class="ac" style="display:none"></div></div></label>' +
     '<input type="hidden" id="o_custid" value="' + esc(existing ? (existing._ledgerId || '') : '') + '">' +
     '<label class="f full">Approved Blend<select id="o_blend"><option value="">Select customer first…</option></select></label>' +
     '<label class="f">Qty<input id="o_qty" type="number" min="0" step="any" value="' + esc(existing ? existing.qty : '') + '"></label>' +
@@ -445,12 +449,10 @@ function orderModal(existing, reload) {
     if (!items.length) { ac.style.display = 'none'; return; }
     ac.style.display = 'block';
     ac.innerHTML = items.map(function (c, i) {
-      return '<div data-i="' + i + '" class="' + (i === hi ? 'on' : '') + '"><b>' + esc(c.ledgerName) + '</b><br><span class="mut">' + esc(c.ledgerId || '') + ' · ' + esc(c.route || '') + ' ' + esc(c.routeDay || '') + ' · ' + esc(c.paymentTerms || '') + '</span></div>';
+      return '<div data-i="' + i + '" class="' + (i === hi ? 'on' : '') + '"><b>' + esc(c.ledgerName) + '</b><br><span class="mut">' + esc(c.ledgerId || '') + ' · ' + esc(c.route || '') + ' ' + esc(c.routeDay || '') + '</span></div>';
     }).join('');
     Array.prototype.forEach.call(ac.querySelectorAll('div'), function (d) {
       var pick = function () { pickCust(items[+d.getAttribute('data-i')]); };
-      // mousedown/touchstart fire BEFORE input blur hides the list — a plain
-      // onclick alone loses that race (tap hides list, click never lands).
       d.addEventListener('mousedown', function (e) { e.preventDefault(); pick(); });
       d.addEventListener('touchstart', function (e) { e.preventDefault(); pick(); }, { passive: false });
       d.addEventListener('click', pick);
@@ -493,7 +495,6 @@ function orderModal(existing, reload) {
       if (!$('o_custid').value && d.ledgerId) $('o_custid').value = d.ledgerId;
     }).catch(function (e) { $('o_err').textContent = errMsg(e); });
   };
-  // preselect when editing
   if (isEdit && existing.ledgerName) {
     var payload0 = existing._ledgerId ? { ledgerId: existing._ledgerId } : { ledgerName: existing.ledgerName };
     rpc('getApprovedBlends', payload0, null).then(function (d) {
@@ -588,8 +589,7 @@ function vCustomers(v) {
   reload();
 }
 function customerModal(ledgerId) {
-  var cur = ledgerId ? (S.customers.filter(function (c) { return c.ledgerId === ledgerId; })[0] ||
-    null) : null;
+  var cur = ledgerId ? (S.customers.filter(function (c) { return c.ledgerId === ledgerId; })[0] || null) : null;
   var getCur = cur ? Promise.resolve(cur) :
     (ledgerId ? rpc('searchCustomers', { q: ledgerId, limit: 5 }, null).then(function (r) { return (r || [])[0] || null; }) : Promise.resolve(null));
   getCur.then(function (c) {
@@ -629,10 +629,11 @@ function customerModal(ledgerId) {
 /* ---------------- reports ---------------- */
 function vReports(v) {
   var today = S.boot ? S.boot.today : '';
+  var firstOfMonth = dateMonthStart(today);
   v.innerHTML = '<div class="toolbar"><h2 style="margin:0">Reports</h2>' +
     '<input id="r_q" placeholder="Search summary…"></div>' +
     '<div class="panel"><h3>Customer Summary</h3><div id="r_sum">Loading…</div></div>' +
-    '<div class="panel"><h3>New Customers</h3><div class="toolbar"><input id="n_f" type="date" value="' + esc(today.slice(0, 8) + '01') + '"><input id="n_t" type="date" value="' + esc(today) + '">' +
+    '<div class="panel"><h3>New Customers</h3><div class="toolbar"><input id="n_f" type="date" value="' + esc(firstOfMonth) + '"><input id="n_t" type="date" value="' + esc(today) + '">' +
     '<button class="btn plain" id="n_go">Run</button></div><div id="n_out"></div>' +
     '<p class="mut">Counts ledgers whose first-ever order falls in the period. Edits and duplicates are never counted.</p></div>' +
     '<div class="panel"><h3>Month-to-Date (MTD)</h3><div class="toolbar"><input id="m_m" type="month" value="' + esc(today.slice(0, 7)) + '">' +
@@ -698,7 +699,7 @@ function vHolidays(v) {
 var PARSED = [];
 function vImport(v) {
   v.innerHTML = '<div class="panel"><h3>Bulk Import (Validate → Preview → Confirm)</h3>' +
-    '<div class="toolbar"><select id="i_kind"><option value="orders">Orders</option><option value="delivered">Delivered Orders</option><option value="customers">Customers</option><option value="products">Products/Blends</option></select>' +
+    '<div class="toolbar"><select id="i_kind"><option value="orders">Orders</option><option value="delivered">Delivered Orders</option><option value="customers">Customers</option><option value="products">Products</option></select>' +
     '<button class="btn plain" id="i_tpl">Download Template</button></div>' +
     '<label class="f">Paste CSV (first row = headers)<textarea id="i_csv" rows="8" style="width:100%"></textarea></label>' +
     '<div class="toolbar"><button class="btn plain" id="i_val">Validate</button><button class="btn" id="i_go" disabled>Confirm &amp; Write</button></div>' +
